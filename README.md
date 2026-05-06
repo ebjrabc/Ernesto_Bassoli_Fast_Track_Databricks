@@ -1,1 +1,0 @@
-# Ernesto_Bassoli_Fast_Track_Databricks
