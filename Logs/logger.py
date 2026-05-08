@@ -105,7 +105,7 @@ logger = logging.getLogger("fast_track")
 # ============================================================
 
 # Catalogo no Unity Catalog
-LOG_CATALOG = "dt0025_dev"
+LOG_CATALOG = "uc_fast_track"
 
 # Schema onde fica a tabela de logs
 LOG_SCHEMA = "ft_bronze"
@@ -115,6 +115,16 @@ LOG_TABLE = "_pipeline_logs"
 
 # Nome completo (catalog.schema.table)
 LOG_FULL_TABLE = f"{LOG_CATALOG}.{LOG_SCHEMA}.{LOG_TABLE}"
+
+# COMMAND ----------
+
+# DBTITLE 1,Cria o catalogo se não existir
+spark.sql(f"""CREATE CATALOG IF NOT EXISTS {LOG_CATALOG}""")
+
+# COMMAND ----------
+
+# DBTITLE 1,Cria o schema log se não existir
+spark.sql(f"""CREATE DATABASE IF NOT EXISTS {LOG_CATALOG}.{LOG_SCHEMA}""")
 
 # COMMAND ----------
 
@@ -138,39 +148,39 @@ LOG_FULL_TABLE = f"{LOG_CATALOG}.{LOG_SCHEMA}.{LOG_TABLE}"
 
 # Comando SQL para criar a tabela de logs
 spark.sql(f"""
-    # Executa operacao de processamento
+    -- Executa operacao de processamento
     CREATE TABLE IF NOT EXISTS {LOG_FULL_TABLE} (
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         log_id STRING,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         timestamp TIMESTAMP,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         nivel STRING,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         notebook STRING,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         etapa STRING,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         mensagem STRING,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         detalhes STRING,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         duracao_segundos DOUBLE,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         registros_afetados LONG,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         status STRING,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         erro_tipo STRING,
-        # Executa operacao de processamento
+        -- Executa operacao de processamento
         erro_stack STRING
-    # Fecha bloco de parametros
+    -- Fecha bloco de parametros
     )
-    # Executa operacao de processamento
+    -- Executa operacao de processamento
     USING DELTA
-    # Executa operacao de processamento
+    -- Executa operacao de processamento
     COMMENT 'Logs centralizados do pipeline Fast Track - Camara dos Deputados'
-# Executa operacao de processamento
+-- Executa operacao de processamento
 """)
 
 # COMMAND ----------
@@ -229,7 +239,7 @@ def _persist_log(nivel, etapa, mensagem, detalhes="", duracao=None, registros=No
             # Executa operacao de processamento
             "log_id": _generate_log_id(),
             # Executa operacao de processamento
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(),
             # Executa operacao de processamento
             "nivel": nivel,
             # Executa operacao de processamento
@@ -252,8 +262,27 @@ def _persist_log(nivel, etapa, mensagem, detalhes="", duracao=None, registros=No
             "erro_stack": str(erro_stack)[:2000] if erro_stack else ""
         # Executa operacao de processamento
         }]
-        # Converte para DataFrame e grava na tabela
-        df = spark.createDataFrame(data)
+        
+        # CORRECAO: Define schema explicito para evitar erro de inferencia
+        from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, TimestampType
+        
+        log_schema = StructType([
+            StructField("log_id", StringType(), False),
+            StructField("timestamp", TimestampType(), False),
+            StructField("nivel", StringType(), False),
+            StructField("notebook", StringType(), False),
+            StructField("etapa", StringType(), False),
+            StructField("mensagem", StringType(), True),
+            StructField("detalhes", StringType(), True),
+            StructField("duracao_segundos", DoubleType(), True),
+            StructField("registros_afetados", LongType(), True),
+            StructField("status", StringType(), True),
+            StructField("erro_tipo", StringType(), True),
+            StructField("erro_stack", StringType(), True)
+        ])
+        
+        # Converte para DataFrame com schema explicito
+        df = spark.createDataFrame(data, schema=log_schema)
         # Executa operacao de processamento
         df.write.format("delta").mode("append").saveAsTable(LOG_FULL_TABLE)
     # Captura e trata o erro

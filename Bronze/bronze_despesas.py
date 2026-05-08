@@ -1,9 +1,7 @@
 # Databricks notebook source
 # DBTITLE 1,Banner do Projeto
 # MAGIC %md
-# MAGIC <img src="https://dadosabertos.camara.leg.br/api/v2/imgs/logo_camara.png" width="150"/>
-# MAGIC
-# MAGIC ---
+# MAGIC <img src="https://gazetadasemana.com.br/images/noticias/166864/19041851_compass.uo.jpg.jpg" width="450"/>
 
 # COMMAND ----------
 
@@ -295,4 +293,3 @@ if despesas_lista:
 
 # Chama funcao de finalizacao que exibe resumo e registra log
 finalizar_notebook()
-

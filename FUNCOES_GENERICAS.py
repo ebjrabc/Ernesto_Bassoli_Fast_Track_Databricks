@@ -135,7 +135,7 @@ REQUEST_TIMEOUT = 30
 # ============================================================
 
 # Nome do catalogo no Unity Catalog
-CATALOG = "dt0025_dev"
+CATALOG = "uc_fast_track"
 
 # Schema da camada Bronze (dados brutos)
 BRONZE_SCHEMA = "ft_bronze"
@@ -185,6 +185,11 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SILVER_SCHEMA}")
 
 # Cria o schema da camada Gold para dados analiticos
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{GOLD_SCHEMA}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
 
 # COMMAND ----------
 
@@ -573,8 +578,22 @@ def save_to_bronze(data: list, table_name: str, endpoint: str = "", mode: str = 
         # Retorna zero registros
         return 0
     
-    # Converte a lista de dicionarios em DataFrame Spark
-    df = spark.createDataFrame(data)
+    # CORRECAO: Inferir schema a partir do primeiro registro
+    # Isso garante que campos com valores None sejam tipados como StringType
+    from pyspark.sql.types import StructType, StructField, StringType
+    
+    # Extrai todas as chaves unicas de todos os registros
+    all_keys = set()
+    for record in data:
+        all_keys.update(record.keys())
+    
+    # Cria schema com todos os campos como String (evita erro de inferencia)
+    # O Delta Lake fara casting automatico quando necessario
+    schema_fields = [StructField(key, StringType(), True) for key in sorted(all_keys)]
+    schema = StructType(schema_fields)
+    
+    # Converte a lista de dicionarios em DataFrame Spark com schema explícito
+    df = spark.createDataFrame(data, schema=schema)
     
     # Adiciona coluna com timestamp da ingestao (auditoria)
     df = df.withColumn("_ingested_at", current_timestamp())
@@ -1033,4 +1052,3 @@ def finalizar_notebook():
     
     # Registra fim do notebook no log
     log_notebook_end(_CURRENT_NOTEBOOK, status="SUCCESS")
-
