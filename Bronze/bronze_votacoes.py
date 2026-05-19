@@ -129,29 +129,60 @@ else:
 
 # DBTITLE 1,Ingere Votacoes
 # ============================================================
-# INGESTAO DAS VOTACOES NOMINAIS
+# INGESTAO DAS VOTACOES NOMINAIS (OTIMIZADO COM CHECKPOINTS)
 # ============================================================
-# Busca votacoes do plenario e comissoes. Cada votacao
-# contem: id, data, orgao, proposicao relacionada,
-# descricao e resultado.
+# Busca votacoes do plenario e comissoes em lotes de 10.
+# Grava incrementalmente para liberar memoria.
 # ============================================================
 
-# Informa o usuario que a ingestao esta iniciando
-print("Ingerindo votacoes...")
+print("Ingerindo votacoes (versão otimizada com checkpoints)...")
 
 # Busca votacoes da API com paginacao automatica
-votacoes_lista = fetch_api(
+votacoes_completas = fetch_api(
     endpoint="/votacoes",
     params=params_votacoes
 )
 
 # Filtra apenas votacoes novas (ID maior que o watermark)
 if isinstance(watermark, dict) and watermark.get("last_id"):
-    # Mantem apenas votacoes com ID posterior ao ultimo processado
-    votacoes_lista = [v for v in votacoes_lista if str(v['id']) > str(watermark['last_id'])]
+    votacoes_completas = [v for v in votacoes_completas if str(v['id']) > str(watermark['last_id'])]
 
-# Exibe quantidade de votacoes novas encontradas
-print(f"   Votacoes novas: {len(votacoes_lista)}")
+print(f"   Votacoes novas encontradas: {len(votacoes_completas)}")
+
+# Configuracoes de checkpoint
+BATCH_SIZE = 10  # Processa de 10 em 10
+total_gravado = 0
+
+if len(votacoes_completas) == 0:
+    print("   Nenhuma votacao nova para processar")
+    votacoes_lista = []  # Lista vazia para uso posterior
+else:
+    # Processa em lotes de 10
+    for i in range(0, len(votacoes_completas), BATCH_SIZE):
+        batch = votacoes_completas[i:i+BATCH_SIZE]
+        batch_num = i//BATCH_SIZE + 1
+        total_batches = (len(votacoes_completas)-1)//BATCH_SIZE + 1
+        
+        print(f"   Batch {batch_num}/{total_batches}: Processando {len(batch)} votacoes...")
+        
+        # Define modo: overwrite no primeiro batch, append nos demais
+        mode = "overwrite" if i == 0 else "append"
+        
+        # Grava o batch
+        n = save_to_bronze(batch, "votacoes", "/votacoes", mode=mode)
+        total_gravado += len(batch)
+        
+        print(f"      Gravadas: {len(batch)} votacoes (Total: {total_gravado})")
+        
+        # Limpa memoria - mantem apenas IDs para processamento de votos
+        if i == 0:
+            votacoes_lista = [{'id': v['id'], 'data': v.get('data', v.get('dataHoraRegistro', '')), 'siglaOrgao': v.get('siglaOrgao', '')} for v in votacoes_completas]
+        
+        # Pausa entre batches
+        if i + BATCH_SIZE < len(votacoes_completas):
+            time.sleep(0.5)
+    
+    print(f"   CONCLUIDO: {total_gravado} votacoes gravadas no total")
 
 # COMMAND ----------
 
@@ -165,61 +196,83 @@ print(f"   Votacoes novas: {len(votacoes_lista)}")
 
 # DBTITLE 1,Ingere Votos Individuais
 # ============================================================
-# INGESTAO DOS VOTOS DE CADA DEPUTADO
+# INGESTAO DOS VOTOS DE CADA DEPUTADO (OTIMIZADO)
 # ============================================================
-# Para cada votacao, busca os votos individuais.
-# Essencial para analise de coesao partidaria
-# e correlacao com frentes parlamentares.
+# Para cada votacao, busca os votos individuais em lotes de 10.
+# Grava incrementalmente para liberar memoria.
 # ============================================================
 
-# Informa o usuario que a ingestao de votos esta iniciando
-print("Ingerindo votos individuais...")
+print("Ingerindo votos individuais (modo otimizado com checkpoints)...")
 
-# Lista para acumular todos os votos
+# Lista para acumular votos antes do checkpoint
 votos_lista = []
 
+# Contador de registros gravados
+total_gravado = 0
+
+# Configuracao de processamento
+BATCH_SIZE = 10  # Processa 10 votacoes por vez
+MAX_WORKERS = 10  # Threads paralelas
+
 # Total de votacoes para calculo de progresso
-total = len(votacoes_lista)
+total_votacoes = len(votacoes_lista)
 
-# Loop: percorre cada votacao para buscar votos individuais
-for i, votacao in enumerate(votacoes_lista):
-    # Extrai o ID da votacao atual
-    vot_id = votacao['id']
+if total_votacoes == 0:
+    print("   Nenhuma votacao para processar")
+else:
+    # Loop: processa votacoes em batches de 10
+    for batch_start in range(0, total_votacoes, BATCH_SIZE):
+        # Extrai batch atual
+        batch_end = min(batch_start + BATCH_SIZE, total_votacoes)
+        batch = votacoes_lista[batch_start:batch_end]
+        
+        # Prepara lista de tuplas (endpoint, params) para fetch paralelo
+        endpoints_list = [(f"/votacoes/{v['id']}/votos", {}) for v in batch]
+        
+        # Exibe progresso
+        batch_num = batch_start//BATCH_SIZE + 1
+        total_batches = (total_votacoes-1)//BATCH_SIZE + 1
+        print(f"   Batch {batch_num}/{total_batches}: Processando {len(batch)} votacoes...")
+        
+        # Busca votos em paralelo (10 threads)
+        resultados = fetch_api_parallel(
+            endpoints_list=endpoints_list,
+            max_workers=MAX_WORKERS
+        )
+        
+        # Processa resultados do batch
+        votos_batch = []
+        for idx, resultado in enumerate(resultados):
+            if resultado['success']:
+                # Pega a votacao correspondente
+                votacao = batch[idx]
+                vot_id = votacao['id']
+                
+                # Para cada voto, adiciona campos de referencia
+                for voto in resultado['data']:
+                    voto['_votacao_id'] = vot_id
+                    voto['_votacao_data'] = votacao.get('data', '')
+                    voto['_sigla_orgao'] = votacao.get('siglaOrgao', '')
+                
+                # Acumula votos do batch
+                votos_batch.extend(resultado['data'])
+        
+        # CHECKPOINT: Grava o batch e limpa memoria
+        if votos_batch:
+            mode = "overwrite" if batch_start == 0 else "append"
+            n_votos = save_to_bronze(votos_batch, "votos", "/votacoes/{id}/votos", mode=mode)
+            total_gravado += n_votos
+            print(f"      Gravados: {n_votos} votos (Total: {total_gravado})")
+            
+            # Limpa memoria
+            votos_batch = []
+        
+        # Pequena pausa entre batches
+        if batch_start + BATCH_SIZE < total_votacoes:
+            time.sleep(0.5)
     
-    try:
-        # Busca votos individuais desta votacao
-        dados = fetch_api(f"/votacoes/{vot_id}/votos")
-        
-        # Para cada voto, adiciona campos de referencia
-        for d in dados:
-            # Adiciona o ID da votacao como campo auxiliar
-            d['_votacao_id'] = vot_id
-            # Adiciona a data da votacao
-            d['_votacao_data'] = votacao.get('data', votacao.get('dataHoraRegistro', ''))
-            # Adiciona a sigla do orgao onde ocorreu
-            d['_sigla_orgao'] = votacao.get('siglaOrgao', '')
-        
-        # Adiciona os votos desta votacao a lista geral
-        votos_lista.extend(dados)
-        
-    # Erro de conexao (rede indisponivel)
-    except requests.exceptions.ConnectionError:
-        # Informa o usuario e interrompe o loop
-        print(f"  ERRO DE CONEXAO na votacao {vot_id} - abortando")
-        break
-        
-    # Qualquer outro erro
-    except Exception as e:
-        # Informa o usuario e continua com a proxima votacao
-        print(f"  Erro na votacao {vot_id}: {str(e)[:60]}")
-    
-    # A cada 50 votacoes, exibe progresso
-    if (i + 1) % 50 == 0:
-        print(f"   Progresso: {i+1}/{total} ({(i+1)*100//total}%)")
-        time.sleep(0.3)
-
-# Exibe total de votos obtidos
-print(f"   Total votos: {len(votos_lista)} registros")
+    # Exibe total final
+    print(f"   CONCLUIDO: {total_gravado} votos gravados no total")
 
 # COMMAND ----------
 
@@ -238,23 +291,26 @@ print(f"   Total votos: {len(votos_lista)} registros")
 
 # DBTITLE 1,Grava Bronze Votacoes
 # ============================================================
-# GRAVACAO NA CAMADA BRONZE
+# NOTA: GRAVACAO JA REALIZADA
 # ============================================================
-# Grava votacoes e votos em modo append para preservar
-# historico completo.
+# A gravacao dos dados ja foi realizada nas celulas anteriores:
+# - Votacoes: gravadas em lotes de 10 na celula "Ingere Votacoes"
+# - Votos: gravados em lotes de 10 na celula "Ingere Votos Individuais"
+# 
+# Esta celula foi mantida apenas para preservar a estrutura
+# do notebook e registrar no status_list.
 # ============================================================
 
-# Grava votacoes na tabela bronze (append)
-n1 = save_to_bronze(votacoes_lista, "votacoes", "/votacoes", mode="append")
+print("Dados ja gravados nas celulas anteriores.")
 
 # Registra status para o resumo final
-status_list.append({"tabela": "ft_bronze.votacoes", "registros": n1})
-
-# Grava votos individuais na tabela bronze (append)
-n2 = save_to_bronze(votos_lista, "votos", "/votacoes/{id}/votos", mode="append")
-
-# Registra status para o resumo final
-status_list.append({"tabela": "ft_bronze.votos", "registros": n2})
+if 'total_gravado' in dir() and total_gravado > 0:
+    status_list.append({"tabela": "ft_bronze.votacoes", "registros": len(votacoes_lista) if votacoes_lista else 0})
+    status_list.append({"tabela": "ft_bronze.votos", "registros": total_gravado})
+    print(f"   - ft_bronze.votacoes: {len(votacoes_lista) if votacoes_lista else 0} registros")
+    print(f"   - ft_bronze.votos: {total_gravado} registros")
+else:
+    print("   Nenhum registro processado nesta execucao")
 
 # COMMAND ----------
 

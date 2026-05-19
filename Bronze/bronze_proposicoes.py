@@ -130,25 +130,32 @@ else:
 
 # DBTITLE 1,Ingere Proposicoes
 # ============================================================
-# INGESTAO DAS PROPOSICOES LEGISLATIVAS
+# INGESTAO DAS PROPOSICOES LEGISLATIVAS (OTIMIZADO)
 # ============================================================
 # Busca PLs, PECs, MPs e demais proposicoes por tipo.
-# Cada registro contem: id, tipo, numero, ano, ementa.
+# Grava em lotes de 10 para liberar memoria.
 # ============================================================
 
-# Informa o usuario que a ingestao esta iniciando
-print("Ingerindo proposicoes legislativas...")
+print("Ingerindo proposicoes legislativas (versao otimizada com checkpoints)...")
 
 # Lista de tipos de proposicao a buscar
 tipos = ["PL", "PEC", "MP", "PLP", "PDL"]
 
-# Lista para acumular todas as proposicoes
-proposicoes_lista = []
+# Lista para manter apenas IDs (para buscar tramitacoes depois)
+proposicoes_ids = []
 
-# Loop: busca proposicoes de cada tipo separadamente
+# Contador total
+total_gravado = 0
+
+# Configuracao de checkpoint
+BATCH_SIZE = 10  # Grava de 10 em 10
+
+# Loop: busca proposicoes de cada tipo
 for tipo in tipos:
+    print(f"   Processando tipo: {tipo}")
+    
     # Busca proposicoes deste tipo via API
-    dados = fetch_api(
+    proposicoes_tipo = fetch_api(
         endpoint="/proposicoes",
         params={
             "siglaTipo": tipo,
@@ -158,13 +165,55 @@ for tipo in tipos:
             "ordem": "ASC"
         }
     )
-    # Adiciona a lista geral
-    proposicoes_lista.extend(dados)
-    # Exibe quantidade por tipo
-    print(f"   {tipo}: {len(dados)} proposicoes")
+    
+    print(f"      {tipo}: {len(proposicoes_tipo)} proposicoes encontradas")
+    
+    # Se nao houver proposicoes deste tipo, pula
+    if not proposicoes_tipo:
+        continue
+    
+    # Processa em lotes de 10
+    for i in range(0, len(proposicoes_tipo), BATCH_SIZE):
+        batch = proposicoes_tipo[i:i+BATCH_SIZE]
+        batch_num = i//BATCH_SIZE + 1
+        total_batches = (len(proposicoes_tipo)-1)//BATCH_SIZE + 1
+        
+        # Define modo: overwrite no primeiro batch do primeiro tipo, append nos demais
+        if tipo == "PL" and i == 0:
+            mode = "overwrite"
+        else:
+            mode = "append"
+        
+        # Grava o batch
+        n = save_to_bronze(batch, "proposicoes", "/proposicoes", mode=mode)
+        total_gravado += len(batch)
+        
+        # Guarda apenas IDs e dados minimos para buscar tramitacoes
+        for p in batch:
+            proposicoes_ids.append({
+                'id': p['id'],
+                'siglaTipo': p.get('siglaTipo', ''),
+                'numero': p.get('numero', ''),
+                'ano': p.get('ano', ''),
+                'dataApresentacao': p.get('dataApresentacao', '')
+            })
+        
+        print(f"      Batch {batch_num}/{total_batches}: Gravadas {len(batch)} proposicoes (Total: {total_gravado})")
+        
+        # Limpa memoria do batch
+        batch = []
+    
+    # Limpa memoria das proposicoes deste tipo
+    proposicoes_tipo = []
+    
+    # Pequena pausa entre tipos
+    time.sleep(0.5)
 
-# Exibe total geral
-print(f"   Total proposicoes: {len(proposicoes_lista)}")
+print(f"   CONCLUIDO: {total_gravado} proposicoes gravadas no total")
+print(f"   IDs salvos para buscar tramitacoes: {len(proposicoes_ids)}")
+
+# Cria proposicoes_lista apenas com IDs minimos (para compatibilidade)
+proposicoes_lista = proposicoes_ids
 
 # COMMAND ----------
 
@@ -179,65 +228,85 @@ print(f"   Total proposicoes: {len(proposicoes_lista)}")
 
 # DBTITLE 1,Ingere Tramitacoes CDC
 # ============================================================
-# INGESTAO DAS TRAMITACOES (BASE PARA CDC)
+# INGESTAO DAS TRAMITACOES (OTIMIZADO COM CHECKPOINTS)
 # ============================================================
-# Para cada proposicao, busca o historico de tramitacoes.
-# Gera hash do payload para deteccao de mudancas (CDC).
+# Para cada proposicao, busca tramitacoes em lotes de 10.
+# Grava incrementalmente para liberar memoria.
 # ============================================================
 
-# Informa o usuario que a ingestao de tramitacoes esta iniciando
-print("Ingerindo tramitacoes (CDC)...")
+print("Ingerindo tramitacoes CDC (versao otimizada com checkpoints)...")
 
-# Lista para acumular todas as tramitacoes
-tramitacoes_lista = []
+# Configuracao de processamento
+BATCH_SIZE = 10  # Processa 10 proposicoes por vez
 
-# Total de proposicoes para calculo de progresso
+# Contador total
+total_gravado = 0
+
+# Total de proposicoes
 total = len(proposicoes_lista)
 
-# Loop: percorre cada proposicao para buscar tramitacoes
-for i, prop in enumerate(proposicoes_lista):
-    # Extrai o ID da proposicao atual
-    prop_id = prop['id']
+if total == 0:
+    print("   Nenhuma proposicao para processar")
+    tramitacoes_lista = []  # Lista vazia para compatibilidade
+else:
+    # Processa em lotes de 10 proposicoes
+    for batch_start in range(0, total, BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, total)
+        batch = proposicoes_lista[batch_start:batch_end]
+        
+        batch_num = batch_start//BATCH_SIZE + 1
+        total_batches = (total-1)//BATCH_SIZE + 1
+        
+        print(f"   Batch {batch_num}/{total_batches}: Processando {len(batch)} proposicoes...")
+        
+        # Lista para acumular tramitacoes deste batch
+        tramitacoes_batch = []
+        
+        # Processa cada proposicao do batch
+        for prop in batch:
+            prop_id = prop['id']
+            
+            try:
+                # Busca tramitacoes desta proposicao
+                dados = fetch_api(f"/proposicoes/{prop_id}/tramitacoes")
+                
+                # Para cada tramitacao, adiciona campos auxiliares e hash
+                for d in dados:
+                    d['_proposicao_id'] = prop_id
+                    d['_sigla_tipo'] = prop.get('siglaTipo', '')
+                    d['_numero'] = prop.get('numero', '')
+                    d['_ano'] = prop.get('ano', '')
+                    # Gera hash MD5 do payload para CDC
+                    payload = json.dumps(d, sort_keys=True, default=str)
+                    d['_payload_hash'] = str(hash(payload))
+                
+                # Acumula tramitacoes
+                tramitacoes_batch.extend(dados)
+                
+            except requests.exceptions.ConnectionError:
+                print(f"      ERRO DE CONEXAO na proposicao {prop_id} - abortando")
+                break
+            except Exception as e:
+                print(f"      Erro na proposicao {prop_id}: {str(e)[:60]}")
+        
+        # CHECKPOINT: Grava o batch
+        if tramitacoes_batch:
+            mode = "overwrite" if batch_start == 0 else "append"
+            n = save_to_bronze(tramitacoes_batch, "tramitacoes", "/proposicoes/{id}/tramitacoes", mode=mode)
+            total_gravado += len(tramitacoes_batch)
+            print(f"      Gravadas: {len(tramitacoes_batch)} tramitacoes (Total: {total_gravado})")
+            
+            # Limpa memoria
+            tramitacoes_batch = []
+        
+        # Pequena pausa entre batches
+        if batch_start + BATCH_SIZE < total:
+            time.sleep(0.5)
     
-    try:
-        # Busca tramitacoes desta proposicao
-        dados = fetch_api(f"/proposicoes/{prop_id}/tramitacoes")
-        
-        # Para cada tramitacao, adiciona campos auxiliares e hash
-        for d in dados:
-            # Adiciona ID da proposicao como referencia
-            d['_proposicao_id'] = prop_id
-            # Adiciona tipo da proposicao (PL, PEC, etc)
-            d['_sigla_tipo'] = prop.get('siglaTipo', '')
-            # Adiciona numero da proposicao
-            d['_numero'] = prop.get('numero', '')
-            # Adiciona ano da proposicao
-            d['_ano'] = prop.get('ano', '')
-            # Gera hash MD5 do payload para CDC (deteccao de mudancas)
-            payload = json.dumps(d, sort_keys=True, default=str)
-            d['_payload_hash'] = str(hash(payload))
-        
-        # Adiciona as tramitacoes desta proposicao a lista geral
-        tramitacoes_lista.extend(dados)
-        
-    # Erro de conexao (rede indisponivel)
-    except requests.exceptions.ConnectionError:
-        # Informa o usuario e interrompe
-        print(f"  ERRO DE CONEXAO na proposicao {prop_id} - abortando")
-        break
-        
-    # Qualquer outro erro
-    except Exception as e:
-        # Informa o usuario e continua
-        print(f"  Erro na proposicao {prop_id}: {str(e)[:60]}")
+    print(f"   CONCLUIDO: {total_gravado} tramitacoes gravadas no total")
     
-    # A cada 100 proposicoes, exibe progresso
-    if (i + 1) % 100 == 0:
-        print(f"   Progresso: {i+1}/{total} ({(i+1)*100//total}%)")
-        time.sleep(0.3)
-
-# Exibe total de tramitacoes obtidas
-print(f"   Total tramitacoes: {len(tramitacoes_lista)} registros")
+    # Cria tramitacoes_lista vazia (dados ja gravados)
+    tramitacoes_lista = []
 
 # COMMAND ----------
 
@@ -256,22 +325,30 @@ print(f"   Total tramitacoes: {len(tramitacoes_lista)} registros")
 
 # DBTITLE 1,Grava Bronze Proposicoes
 # ============================================================
-# GRAVACAO NA CAMADA BRONZE
+# NOTA: GRAVACAO JA REALIZADA
 # ============================================================
-# Grava proposicoes e tramitacoes em modo append.
+# A gravacao dos dados ja foi realizada nas celulas anteriores:
+# - Proposicoes: gravadas em lotes de 10 na celula "Ingere Proposicoes"
+# - Tramitacoes: gravadas em lotes de 10 na celula "Ingere Tramitacoes CDC"
+# 
+# Esta celula foi mantida apenas para preservar a estrutura
+# do notebook e registrar no status_list.
 # ============================================================
 
-# Grava proposicoes na tabela bronze (append)
-n1 = save_to_bronze(proposicoes_lista, "proposicoes", "/proposicoes", mode="append")
+print("Dados ja gravados nas celulas anteriores.")
 
-# Registra status para o resumo final
-status_list.append({"tabela": "ft_bronze.proposicoes", "registros": n1})
+# Conta registros das tabelas para o status
+if proposicoes_lista:
+    n1 = len(proposicoes_lista)
+    status_list.append({"tabela": "ft_bronze.proposicoes", "registros": n1})
+    print(f"   - ft_bronze.proposicoes: {n1} registros")
 
-# Grava tramitacoes com hash CDC na tabela bronze (append)
-n2 = save_to_bronze(tramitacoes_lista, "tramitacoes", "/proposicoes/{id}/tramitacoes", mode="append")
-
-# Registra status para o resumo final
-status_list.append({"tabela": "ft_bronze.tramitacoes", "registros": n2})
+# Para tramitacoes, usa o contador total_gravado da celula anterior
+if 'total_gravado' in dir() and total_gravado > 0:
+    status_list.append({"tabela": "ft_bronze.tramitacoes", "registros": total_gravado})
+    print(f"   - ft_bronze.tramitacoes: {total_gravado} registros")
+else:
+    print("   Nenhum registro processado nesta execucao")
 
 # COMMAND ----------
 

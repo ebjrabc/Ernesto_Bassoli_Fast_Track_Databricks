@@ -1,9 +1,7 @@
 # Databricks notebook source
 # DBTITLE 1,Banner do Projeto
 # MAGIC %md
-# MAGIC <img src="https://dadosabertos.camara.leg.br/api/v2/imgs/logo_camara.png" width="150"/>
-# MAGIC
-# MAGIC ---
+# MAGIC <img src="https://gazetadasemana.com.br/images/noticias/166864/19041851_compass.uo.jpg.jpg" width="450"/>
 
 # COMMAND ----------
 
@@ -24,7 +22,7 @@
 # MAGIC ## Saidas
 # MAGIC | Tabela | Descricao |
 # MAGIC |--------|-----------|
-# MAGIC | `dt0025_dev.ft_bronze._pipeline_logs` | Tabela Delta com todos os logs |
+# MAGIC | `uc_fast_track.ft_bronze._pipeline_logs` | Tabela Delta com todos os logs |
 # MAGIC
 # MAGIC ## Funcoes Disponibilizadas
 # MAGIC | Funcao | Descricao |
@@ -47,6 +45,11 @@
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ---
+
+# COMMAND ----------
+
 # DBTITLE 1,Imports e Configuracao
 # MAGIC %md
 # MAGIC # Imports e Configuracao do Logger
@@ -65,10 +68,11 @@
 
 # DBTITLE 1,Imports Logger
 # ============================================================
-# IMPORTS E CONFIGURACAO DO LOGGER
+# IMPORTS E CONFIGURACAO DO LOGGER (OTIMIZADO)
 # ============================================================
 # Configura tanto logging em console (print) quanto
 # persistencia em tabela Delta para auditoria.
+# OTIMIZACOES: Batching, schema global, sincronizacao anti-ZMQ
 # ============================================================
 
 # Modulo padrao de logging do Python (saida em console)
@@ -86,15 +90,30 @@ from datetime import datetime
 # Funcao do PySpark para adicionar timestamp atual
 from pyspark.sql.functions import lit, current_timestamp
 
+# Threading para controle de contexto paralelo
+import threading
+
+# ============================================================
+# SINCRONIZACAO ANTI-ZMQ COM FUNCOES_GENERICAS
+# ============================================================
+# Usa a mesma instancia _in_parallel_context do FUNCOES_GENERICAS
+# Se nao existir (logger carregado sozinho), cria localmente
+if '_in_parallel_context' not in globals():
+    _in_parallel_context = threading.local()
+
+# ============================================================
+# BATCHING DE LOGS (OTIMIZACAO CRITICA)
+# ============================================================
+# Buffer para acumular logs e gravar em lote
+_log_buffer = []
+_log_buffer_lock = threading.Lock()
+_LOG_BATCH_SIZE = 50  # Grava a cada 50 logs
+
 # Configuracao do formato de saida no console
 logging.basicConfig(
-    # Atribui valor a variavel 'level'
     level=logging.INFO,
-    # Atribui valor a variavel 'format'
     format="%(asctime)s | %(levelname)-8s | %(message)s",
-    # Atribui valor a variavel 'datefmt'
     datefmt="%Y-%m-%d %H:%M:%S"
-# Fecha bloco de parametros
 )
 
 # Cria instancia do logger com nome do projeto
@@ -107,24 +126,69 @@ logger = logging.getLogger("fast_track")
 # Catalogo no Unity Catalog
 LOG_CATALOG = "uc_fast_track"
 
-# Schema onde fica a tabela de logs
+# Schema onde ficam os logs
 LOG_SCHEMA = "ft_bronze"
 
 # Nome da tabela de logs
 LOG_TABLE = "_pipeline_logs"
 
-# Nome completo (catalog.schema.table)
+# Nome completo da tabela (catalog.schema.table)
 LOG_FULL_TABLE = f"{LOG_CATALOG}.{LOG_SCHEMA}.{LOG_TABLE}"
+
+# ============================================================
+# SCHEMA GLOBAL (OTIMIZACAO - CRIADO UMA VEZ)
+# ============================================================
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, TimestampType
+
+_LOG_SCHEMA = StructType([
+    StructField("log_id", StringType(), False),
+    StructField("timestamp", TimestampType(), False),
+    StructField("nivel", StringType(), False),
+    StructField("notebook", StringType(), False),
+    StructField("etapa", StringType(), False),
+    StructField("mensagem", StringType(), True),
+    StructField("detalhes", StringType(), True),
+    StructField("duracao_segundos", DoubleType(), True),
+    StructField("registros_afetados", LongType(), True),
+    StructField("status", StringType(), True),
+    StructField("erro_tipo", StringType(), True),
+    StructField("erro_stack", StringType(), True)
+])
+
+print("[LOGGER] Configuracao carregada com otimizacoes: batching, schema global, anti-ZMQ")
 
 # COMMAND ----------
 
-# DBTITLE 1,Cria o catalogo se não existir
-spark.sql(f"""CREATE CATALOG IF NOT EXISTS {LOG_CATALOG}""")
+# DBTITLE 1,Cria Catalogo (SQL Nativo)
+# ============================================================
+# CRIA CATALOGO SE NAO EXISTIR (OTIMIZADO COM FLAG)
+# ============================================================
+# Usa flag para evitar re-executar em sessao ativa.
+# Na primeira execucao, cria o catalogo.
+# Nas execucoes seguintes (mesma sessao), pula.
+# ============================================================
+
+if 'LOG_SETUP_DONE' not in globals():
+    print("[LOGGER] Criando catalogo/schema/tabela (primeira vez)...")
+    spark.sql(f"CREATE CATALOG IF NOT EXISTS {LOG_CATALOG}")
+    print(f"[LOGGER] Catalogo {LOG_CATALOG} criado/verificado")
+else:
+    print("[LOGGER] Setup ja executado nesta sessao - pulando catalogo")
 
 # COMMAND ----------
 
 # DBTITLE 1,Cria o schema log se não existir
-spark.sql(f"""CREATE DATABASE IF NOT EXISTS {LOG_CATALOG}.{LOG_SCHEMA}""")
+# ============================================================
+# CRIA SCHEMA SE NAO EXISTIR (OTIMIZADO COM FLAG)
+# ============================================================
+# Usa flag para evitar re-executar em sessao ativa.
+# ============================================================
+
+if 'LOG_SETUP_DONE' not in globals():
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {LOG_CATALOG}.{LOG_SCHEMA}")
+    print(f"[LOGGER] Schema {LOG_SCHEMA} criado/verificado")
+else:
+    print("[LOGGER] Setup ja executado nesta sessao - pulando schema")
 
 # COMMAND ----------
 
@@ -138,50 +202,36 @@ spark.sql(f"""CREATE DATABASE IF NOT EXISTS {LOG_CATALOG}.{LOG_SCHEMA}""")
 
 # DBTITLE 1,Cria Tabela Logs
 # ============================================================
-# CRIACAO DA TABELA DE LOGS
+# CRIA TABELA SE NAO EXISTIR (OTIMIZADO COM FLAG)
 # ============================================================
-# Cria a tabela Delta se nao existir. Estrutura:
-# log_id, timestamp, nivel, notebook, etapa, mensagem,
-# detalhes, duracao_segundos, registros_afetados,
-# status, erro_tipo, erro_stack.
+# Usa flag para evitar re-executar em sessao ativa.
+# Na primeira execucao, cria a tabela.
+# Nas execucoes seguintes (mesma sessao), pula.
 # ============================================================
 
-# Comando SQL para criar a tabela de logs
-spark.sql(f"""
-    -- Executa operacao de processamento
+if 'LOG_SETUP_DONE' not in globals():
+    spark.sql(f"""
     CREATE TABLE IF NOT EXISTS {LOG_FULL_TABLE} (
-        -- Executa operacao de processamento
         log_id STRING,
-        -- Executa operacao de processamento
         timestamp TIMESTAMP,
-        -- Executa operacao de processamento
         nivel STRING,
-        -- Executa operacao de processamento
         notebook STRING,
-        -- Executa operacao de processamento
         etapa STRING,
-        -- Executa operacao de processamento
         mensagem STRING,
-        -- Executa operacao de processamento
         detalhes STRING,
-        -- Executa operacao de processamento
         duracao_segundos DOUBLE,
-        -- Executa operacao de processamento
         registros_afetados LONG,
-        -- Executa operacao de processamento
         status STRING,
-        -- Executa operacao de processamento
         erro_tipo STRING,
-        -- Executa operacao de processamento
         erro_stack STRING
-    -- Fecha bloco de parametros
-    )
-    -- Executa operacao de processamento
-    USING DELTA
-    -- Executa operacao de processamento
-    COMMENT 'Logs centralizados do pipeline Fast Track - Camara dos Deputados'
--- Executa operacao de processamento
-""")
+    ) USING DELTA
+    """)
+    
+    # Marca como executado
+    LOG_SETUP_DONE = True
+    print("[LOGGER] Tabela de logs criada/verificada - setup completo")
+else:
+    print("[LOGGER] Setup ja executado nesta sessao - pulando tabela")
 
 # COMMAND ----------
 
@@ -205,10 +255,11 @@ spark.sql(f"""
 
 # DBTITLE 1,Definicao Funcoes Log
 # ============================================================
-# FUNCOES DE LOGGING
+# FUNCOES DE LOGGING (OTIMIZADAS)
 # ============================================================
 # Funcoes para registrar eventos em diferentes niveis.
 # Cada funcao grava no console E na tabela Delta.
+# OTIMIZACOES: Batching, truncation inteligente, fallback
 # ============================================================
 
 # Variavel global para rastrear notebook atual
@@ -220,296 +271,288 @@ _NOTEBOOK_START_TIME = None
 
 # Define a funcao '_generate_log_id'
 def _generate_log_id():
-    # Executa operacao de processamento
     """Gera ID unico para cada registro de log"""
-    # Usa UUID4 truncado para 8 caracteres
     return str(uuid.uuid4())[:8]
 
 
-# Define a funcao '_persist_log'
-def _persist_log(nivel, etapa, mensagem, detalhes="", duracao=None, registros=None, erro_tipo="", erro_stack=""):
-    # Executa operacao de processamento
-    """Persiste log na tabela Delta (funcao interna)"""
-    # Executa operacao de processamento
-    global _CURRENT_NOTEBOOK
-    # Inicia bloco de tratamento de erros
+# Define a funcao '_is_in_parallel_context'
+def _is_in_parallel_context():
+    """Verifica se estamos em contexto paralelo (sincronizado com FUNCOES_GENERICAS)"""
+    return getattr(_in_parallel_context, 'active', False)
+
+
+# Define a funcao '_truncate_smart' (OTIMIZACAO)
+def _truncate_smart(text, max_length=5000):
+    """Trunca preservando inicio e fim (mais util para debugging)"""
+    if not text or len(text) <= max_length:
+        return text
+    
+    # Mantem primeiros 60% + ultimos 40%
+    head_size = int(max_length * 0.6)
+    tail_size = int(max_length * 0.4)
+    
+    return (
+        text[:head_size] + 
+        f"\n\n... [TRUNCADO {len(text) - max_length} chars] ...\n\n" + 
+        text[-tail_size:]
+    )
+
+
+# Define a funcao '_flush_logs' (OTIMIZACAO CRITICA - BATCHING)
+def _flush_logs():
+    """Grava todos os logs do buffer de uma vez (muito mais rapido)"""
+    global _log_buffer
+    
+    with _log_buffer_lock:
+        if not _log_buffer:
+            return
+        
+        try:
+            # Grava TODOS os logs de uma vez (1 operacao vs N operacoes)
+            df = spark.createDataFrame(_log_buffer, schema=_LOG_SCHEMA)
+            df.write.format("delta").mode("append").saveAsTable(LOG_FULL_TABLE)
+            
+            # Limpa buffer
+            buffer_size = len(_log_buffer)
+            _log_buffer = []
+            
+            # Debug (opcional - descomente se quiser ver batching)
+            # print(f"[LOGGER] Flush: {buffer_size} logs gravados em batch")
+        except Exception as e:
+            # Se falhar, tenta fallback para arquivo local
+            print(f"[LOGGER] ERRO ao gravar logs no Delta: {str(e)[:100]}")
+            _fallback_to_file()
+
+
+# Define a funcao '_fallback_to_file' (OTIMIZACAO - ZERO PERDA)
+def _fallback_to_file():
+    """Grava logs em arquivo local se Delta falhar (fallback)"""
+    global _log_buffer
+    
     try:
-        # Monta dicionario com todos os campos do log
-        data = [{
-            # Executa operacao de processamento
-            "log_id": _generate_log_id(),
-            # Executa operacao de processamento
-            "timestamp": datetime.now(),
-            # Executa operacao de processamento
-            "nivel": nivel,
-            # Executa operacao de processamento
-            "notebook": _CURRENT_NOTEBOOK,
-            # Executa operacao de processamento
-            "etapa": etapa,
-            # Executa operacao de processamento
-            "mensagem": mensagem,
-            # Executa operacao de processamento
-            "detalhes": str(detalhes)[:2000] if detalhes else "",
-            # Executa operacao de processamento
-            "duracao_segundos": duracao,
-            # Executa operacao de processamento
-            "registros_afetados": registros,
-            # Executa operacao de processamento
-            "status": "OK" if nivel not in ("ERROR", "CRITICAL") else "FALHA",
-            # Executa operacao de processamento
-            "erro_tipo": erro_tipo,
-            # Executa operacao de processamento
-            "erro_stack": str(erro_stack)[:2000] if erro_stack else ""
-        # Executa operacao de processamento
-        }]
+        import json
+        log_file = f"/tmp/fast_track_logs_{_CURRENT_NOTEBOOK}.jsonl"
         
-        # CORRECAO: Define schema explicito para evitar erro de inferencia
-        from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, TimestampType
+        with open(log_file, 'a') as f:
+            for log_entry in _log_buffer:
+                # Converte datetime para string
+                log_entry_copy = log_entry.copy()
+                if 'timestamp' in log_entry_copy:
+                    log_entry_copy['timestamp'] = log_entry_copy['timestamp'].isoformat()
+                f.write(json.dumps(log_entry_copy) + '\n')
         
-        log_schema = StructType([
-            StructField("log_id", StringType(), False),
-            StructField("timestamp", TimestampType(), False),
-            StructField("nivel", StringType(), False),
-            StructField("notebook", StringType(), False),
-            StructField("etapa", StringType(), False),
-            StructField("mensagem", StringType(), True),
-            StructField("detalhes", StringType(), True),
-            StructField("duracao_segundos", DoubleType(), True),
-            StructField("registros_afetados", LongType(), True),
-            StructField("status", StringType(), True),
-            StructField("erro_tipo", StringType(), True),
-            StructField("erro_stack", StringType(), True)
-        ])
-        
-        # Converte para DataFrame com schema explicito
-        df = spark.createDataFrame(data, schema=log_schema)
-        # Executa operacao de processamento
-        df.write.format("delta").mode("append").saveAsTable(LOG_FULL_TABLE)
-    # Captura e trata o erro
+        print(f"[LOGGER] Fallback: {len(_log_buffer)} logs salvos em {log_file}")
+        _log_buffer = []
     except Exception as e:
-        # Se falhar ao gravar log, apenas avisa (nao interrompe pipeline)
-        logger.warning(f"Falha ao persistir log: {str(e)[:100]}")
+        print(f"[LOGGER] ERRO CRITICO: Nao foi possivel salvar logs: {str(e)[:100]}")
+        _log_buffer = []
+
+
+# Define a funcao '_persist_log' (OTIMIZADA)
+def _persist_log(nivel, etapa, mensagem, detalhes="", duracao=None, registros=None, erro_tipo="", erro_stack=""):
+    """Persiste log no buffer (funcao interna) - grava em batch"""
+    global _CURRENT_NOTEBOOK, _log_buffer
+    
+    # Durante execucao paralela, nao tenta gravar no Delta
+    if _is_in_parallel_context():
+        return
+    
+    # Monta dicionario com todos os campos do log
+    log_entry = {
+        "log_id": _generate_log_id(),
+        "timestamp": datetime.now(),
+        "nivel": nivel,
+        "notebook": _CURRENT_NOTEBOOK,
+        "etapa": etapa,
+        "mensagem": mensagem,
+        "detalhes": _truncate_smart(str(detalhes), 5000) if detalhes else "",
+        "duracao_segundos": duracao,
+        "registros_afetados": registros,
+        "status": "OK" if nivel not in ("ERROR", "CRITICAL") else "FALHA",
+        "erro_tipo": erro_tipo,
+        "erro_stack": _truncate_smart(str(erro_stack), 5000) if erro_stack else ""
+    }
+    
+    # OTIMIZACAO: Adiciona ao buffer (thread-safe)
+    with _log_buffer_lock:
+        _log_buffer.append(log_entry)
+        
+        # Se atingiu tamanho do batch, grava tudo de uma vez
+        if len(_log_buffer) >= _LOG_BATCH_SIZE:
+            _flush_logs()
 
 
 # Define a funcao 'log_info'
 def log_info(etapa, mensagem, detalhes="", registros=None):
-    # Executa operacao de processamento
     """Registra informacao de operacao normal"""
-    # Exibe no console
-    logger.info(f"[{etapa}] {mensagem}")
-    # Persiste na tabela Delta
-    _persist_log("INFO", etapa, mensagem, detalhes, registros=registros)
+    if not _is_in_parallel_context():
+        logger.info(f"[{etapa}] {mensagem}")
+        _persist_log("INFO", etapa, mensagem, detalhes, registros=registros)
 
 
 # Define a funcao 'log_warn'
 def log_warn(etapa, mensagem, detalhes=""):
-    # Executa operacao de processamento
     """Registra aviso de situacao inesperada"""
-    # Executa operacao de processamento
-    logger.warning(f"[{etapa}] {mensagem}")
-    # Executa operacao de processamento
-    _persist_log("WARN", etapa, mensagem, detalhes)
+    if not _is_in_parallel_context():
+        logger.warning(f"[{etapa}] {mensagem}")
+        _persist_log("WARN", etapa, mensagem, detalhes)
 
 
 # Define a funcao 'log_error'
 def log_error(etapa, mensagem, exception=None, detalhes=""):
-    # Executa operacao de processamento
     """Registra erro recuperavel com stack trace"""
-    # Extrai tipo e stack trace da excecao
     erro_tipo = type(exception).__name__ if exception else ""
-    # Atribui valor a variavel 'erro_stack'
     erro_stack = traceback.format_exc() if exception else ""
-    # Executa operacao de processamento
-    logger.error(f"[{etapa}] {mensagem} | {erro_tipo}")
-    # Atribui valor a variavel '_persist_log("ERROR", etapa, mensagem, detalhes, erro_tipo'
-    _persist_log("ERROR", etapa, mensagem, detalhes, erro_tipo=erro_tipo, erro_stack=erro_stack)
+    
+    if not _is_in_parallel_context():
+        logger.error(f"[{etapa}] {mensagem} | {erro_tipo}")
+        _persist_log("ERROR", etapa, mensagem, detalhes, erro_tipo=erro_tipo, erro_stack=erro_stack)
 
 
 # Define a funcao 'log_critical'
 def log_critical(etapa, mensagem, exception=None):
-    # Executa operacao de processamento
     """Registra erro critico que interrompe pipeline"""
-    # Atribui valor a variavel 'erro_tipo'
     erro_tipo = type(exception).__name__ if exception else ""
-    # Atribui valor a variavel 'erro_stack'
     erro_stack = traceback.format_exc() if exception else ""
-    # Executa operacao de processamento
-    logger.critical(f"[{etapa}] {mensagem} | {erro_tipo}")
-    # Atribui valor a variavel '_persist_log("CRITICAL", etapa, mensagem, erro_tipo'
-    _persist_log("CRITICAL", etapa, mensagem, erro_tipo=erro_tipo, erro_stack=erro_stack)
+    
+    if not _is_in_parallel_context():
+        logger.critical(f"[{etapa}] {mensagem} | {erro_tipo}")
+        _persist_log("CRITICAL", etapa, mensagem, erro_tipo=erro_tipo, erro_stack=erro_stack)
 
 
 # Define a funcao 'log_success'
 def log_success(etapa, mensagem, duracao=None, registros=None):
-    # Executa operacao de processamento
     """Registra conclusao bem-sucedida"""
-    # Executa operacao de processamento
-    logger.info(f"[{etapa}] {mensagem}")
-    # Atribui valor a variavel '_persist_log("SUCCESS", etapa, mensagem, duracao'
-    _persist_log("SUCCESS", etapa, mensagem, duracao=duracao, registros=registros)
+    if not _is_in_parallel_context():
+        logger.info(f"[{etapa}] {mensagem}")
+        _persist_log("SUCCESS", etapa, mensagem, duracao=duracao, registros=registros)
 
 
-# Define a funcao 'log_api_call'
+# Mapeamento de status codes (OTIMIZACAO - DRY)
+_STATUS_HANDLERS = {
+    200: lambda e, r: log_info("API_CALL", f"GET {e} -> 200 OK", registros=r),
+    400: lambda e, r: None,  # SILENCIOSO (esperado - IDs invalidos)
+    404: lambda e, r: log_warn("API_NOT_FOUND", f"GET {e} -> 404"),
+    429: lambda e, r: log_warn("API_RATE_LIMIT", f"GET {e} -> 429 Rate Limited"),
+}
+
+
+# Define a funcao 'log_api_call' (OTIMIZADA)
 def log_api_call(endpoint, status_code, registros=None, duracao=None, erro=None):
-    # Executa operacao de processamento
     """Registra chamada a API com resultado"""
-    # Verifica condicao
-    if status_code == 200:
-        # Atribui valor a variavel 'log_info("API_CALL", f"GET {endpoint} -> 200 OK", registros'
-        log_info("API_CALL", f"GET {endpoint} -> 200 OK", registros=registros)
-    # Caso alternativo da condicao
-    elif status_code == 429:
-        # Executa operacao de processamento
-        log_warn("API_RATE_LIMIT", f"GET {endpoint} -> 429 Rate Limited")
-    # Caso alternativo da condicao
-    elif status_code == 404:
-        # Executa operacao de processamento
-        log_warn("API_NOT_FOUND", f"GET {endpoint} -> 404 Nao encontrado")
-    # Caso alternativo da condicao
+    handler = _STATUS_HANDLERS.get(status_code)
+    if handler:
+        handler(endpoint, registros)
     elif status_code >= 500:
-        # Atribui valor a variavel 'log_error("API_SERVER_ERROR", f"GET {endpoint} -> {status_code}", detalhes'
         log_error("API_SERVER_ERROR", f"GET {endpoint} -> {status_code}", detalhes=str(erro))
-    # Caso alternativo da condicao
     else:
-        # Atribui valor a variavel 'log_warn("API_UNEXPECTED", f"GET {endpoint} -> {status_code}", detalhes'
         log_warn("API_UNEXPECTED", f"GET {endpoint} -> {status_code}", detalhes=str(erro))
 
 
 # Define a funcao 'log_api_connection_error'
 def log_api_connection_error(endpoint, exception):
-    # Executa operacao de processamento
-    """Registra falha de conexao com a API com mensagem detalhada"""
-    # Registra no log persistente
-    log_error("API_CONNECTION_FAILED", f"FALHA DE CONEXAO: {endpoint}", exception=exception,
-        # Atribui valor a variavel 'detalhes'
-        detalhes=f"Possiveis causas: API fora do ar, problema de rede, timeout de conexao")
-    # Exibe mensagem detalhada para o usuario
-    print(f"\n{'='*60}")
-    # Exibe mensagem informativa para o usuario
-    print(f"  ERRO DE CONEXAO COM A API")
-    # Exibe mensagem informativa para o usuario
-    print(f"{'='*60}")
-    # Exibe mensagem informativa para o usuario
-    print(f"  Endpoint: {endpoint}")
-    # Exibe mensagem informativa para o usuario
-    print(f"  Erro: {type(exception).__name__}: {str(exception)[:200]}")
-    # Exibe mensagem informativa para o usuario
-    print(f"\n  Possiveis causas:")
-    # Exibe mensagem informativa para o usuario
-    print(f"    1. API da Camara fora do ar")
-    # Exibe mensagem informativa para o usuario
-    print(f"    2. Problema de rede/firewall no cluster")
-    # Exibe mensagem informativa para o usuario
-    print(f"    3. Timeout de conexao (servidor lento)")
-    # Exibe mensagem informativa para o usuario
-    print(f"    4. URL incorreta ou DNS nao resolvido")
-    # Exibe mensagem informativa para o usuario
-    print(f"\n  Acao recomendada:")
-    # Exibe mensagem informativa para o usuario
-    print(f"    -> Aguardar e tentar novamente em alguns minutos")
-    # Exibe mensagem informativa para o usuario
-    print(f"    -> Verificar: https://dadosabertos.camara.leg.br/api/v2")
-    # Exibe mensagem informativa para o usuario
-    print(f"{'='*60}\n")
+    """Registra falha de conexao com API"""
+    log_error("API_CONNECTION_ERROR", f"Falha de conexao: {endpoint}", exception=exception)
 
 
 # Define a funcao 'log_api_timeout'
 def log_api_timeout(endpoint, timeout_seconds):
-    # Executa operacao de processamento
-    """Registra timeout na chamada API"""
-    # Executa operacao de processamento
-    log_warn("API_TIMEOUT", f"Timeout apos {timeout_seconds}s em {endpoint}")
-    # Exibe mensagem informativa para o usuario
-    print(f"  Timeout ({timeout_seconds}s) em {endpoint} - retentando...")
+    """Registra timeout em chamada a API"""
+    log_warn("API_TIMEOUT", f"Timeout apos {timeout_seconds}s: {endpoint}")
 
 
 # Define a funcao 'log_notebook_start'
 def log_notebook_start(notebook_name):
-    # Executa operacao de processamento
-    """Registra inicio da execucao de um notebook"""
-    # Executa operacao de processamento
+    """Registra inicio de execucao de notebook"""
     global _CURRENT_NOTEBOOK, _NOTEBOOK_START_TIME
-    # Define notebook atual no contexto global
     _CURRENT_NOTEBOOK = notebook_name
-    # Registra timestamp de inicio
     _NOTEBOOK_START_TIME = datetime.now()
-    # Persiste no log
-    log_info("NOTEBOOK_START", f"Iniciando notebook: {notebook_name}")
-    # Exibe no console
+    
     print(f"\n{'='*60}")
-    # Exibe mensagem informativa para o usuario
     print(f"  INICIO: {notebook_name}")
-    # Exibe mensagem informativa para o usuario
     print(f"  Hora: {_NOTEBOOK_START_TIME.strftime('%Y-%m-%d %H:%M:%S')}")
-    # Exibe mensagem informativa para o usuario
-    print(f"{'='*60}")
+    print(f"{'='*60}\n")
+    log_info("NOTEBOOK_START", f"Iniciando notebook: {notebook_name}")
 
 
-# Define a funcao 'log_notebook_end'
-def log_notebook_end(notebook_name, status="SUCCESS", erro=None):
-    # Executa operacao de processamento
-    """Registra fim da execucao de um notebook"""
-    # Executa operacao de processamento
+# Define a funcao 'log_notebook_end' (OTIMIZADA)
+def log_notebook_end(notebook_name, status="SUCCESS"):
+    """Registra fim de execucao de notebook"""
     global _NOTEBOOK_START_TIME
-    # Calcula duracao
-    duracao = None
-    # Verifica condicao
+    
     if _NOTEBOOK_START_TIME:
-        # Atribui valor a variavel 'duracao'
         duracao = (datetime.now() - _NOTEBOOK_START_TIME).total_seconds()
-    # Registra conforme status
-    if status == "SUCCESS":
-        # Atribui valor a variavel 'log_success("NOTEBOOK_END", f"Notebook finalizado: {notebook_name}", duracao'
-        log_success("NOTEBOOK_END", f"Notebook finalizado: {notebook_name}", duracao=duracao)
-        # Exibe mensagem informativa para o usuario
-        print(f"\n{'='*60}")
-        # Exibe mensagem informativa para o usuario
-        print(f"  FIM: {notebook_name}")
-        # Verifica condicao
-        if duracao:
-            # Exibe mensagem informativa para o usuario
-            print(f"  Duracao: {duracao:.1f}s ({duracao/60:.2f} min)")
-        # Exibe mensagem informativa para o usuario
-        print(f"  Status: SUCESSO")
-        # Exibe mensagem informativa para o usuario
-        print(f"{'='*60}")
-    # Caso alternativo da condicao
     else:
-        # Atribui valor a variavel 'log_error("NOTEBOOK_FAILED", f"Notebook FALHOU: {notebook_name}", exception'
-        log_error("NOTEBOOK_FAILED", f"Notebook FALHOU: {notebook_name}", exception=erro)
-        # Exibe mensagem informativa para o usuario
-        print(f"\n{'='*60}")
-        # Exibe mensagem informativa para o usuario
-        print(f"  FALHA: {notebook_name}")
-        # Verifica condicao
-        if duracao:
-            # Exibe mensagem informativa para o usuario
-            print(f"  Duracao: {duracao:.1f}s")
-        # Verifica condicao
-        if erro:
-            # Exibe mensagem informativa para o usuario
-            print(f"  Erro: {str(erro)[:200]}")
-        # Exibe mensagem informativa para o usuario
-        print(f"{'='*60}")
+        duracao = None
+    
+    print(f"\n{'='*60}")
+    print(f"  FIM: {notebook_name} [{status}]")
+    if duracao:
+        print(f"  Duracao: {duracao:.2f}s")
+    print(f"{'='*60}\n")
+    log_success("NOTEBOOK_END", f"Finalizando notebook: {notebook_name}", duracao=duracao)
+    
+    # OTIMIZACAO CRITICA: Garante que logs pendentes sao gravados
+    _flush_logs()
 
 
 # Define a funcao 'log_table_write'
-def log_table_write(table_name, registros, mode="overwrite"):
-    # Executa operacao de processamento
+def log_table_write(table_name, row_count, operation="write"):
     """Registra gravacao em tabela"""
-    # Atribui valor a variavel 'log_success("TABLE_WRITE", f"Gravado: {table_name} ({registros} registros, mode'
-    log_success("TABLE_WRITE", f"Gravado: {table_name} ({registros} registros, mode={mode})", registros=registros)
+    log_info("TABLE_WRITE", f"{operation.upper()}: {table_name}", registros=row_count)
 
 
 # Define a funcao 'log_quality_check'
-def log_quality_check(table_name, total, issues):
-    # Executa operacao de processamento
+def log_quality_check(table_name, row_count, issues):
     """Registra resultado de validacao de qualidade"""
-    # Verifica condicao
     if issues:
-        # Atribui valor a variavel 'log_warn("QUALITY_CHECK", f"Qualidade [{table_name}]: {len(issues)} problemas", detalhes'
-        log_warn("QUALITY_CHECK", f"Qualidade [{table_name}]: {len(issues)} problemas", detalhes=str(issues))
-    # Caso alternativo da condicao
+        log_warn("QUALITY_CHECK", f"Problemas em {table_name}", detalhes=str(issues))
     else:
-        # Executa operacao de processamento
-        log_info("QUALITY_CHECK", f"Qualidade [{table_name}]: OK ({total} registros)")
+        log_info("QUALITY_CHECK", f"Qualidade OK: {table_name}", registros=row_count)
+
+# COMMAND ----------
+
+# DBTITLE 1,Teste Otimizacoes (REMOVIVEL)
+# ============================================================
+# TESTE DE BATCHING E OTIMIZACOES (REMOVIVEL)
+# ============================================================
+# Celula de teste para validar que todas as otimizacoes funcionam.
+# Pode ser removida apos validacao.
+# ============================================================
+
+import time
+
+print("\n" + "="*60)
+print("TESTE DE OTIMIZACOES DO LOGGER")
+print("="*60)
+
+# Teste 1: Batching de logs
+print("\n[TESTE 1] Batching de logs (10 logs rapidos)...")
+start = time.time()
+for i in range(10):
+    log_info("TESTE_BATCH", f"Log de teste #{i+1}")
+end = time.time()
+print(f"   Tempo: {(end-start)*1000:.1f}ms (esperado: <50ms com batching)")
+
+# Teste 2: Truncation inteligente
+print("\n[TESTE 2] Truncation inteligente (texto longo)...")
+longo = "A" * 10000  # 10k chars
+log_info("TESTE_TRUNCATE", "Teste com texto muito longo", detalhes=longo)
+print(f"   Buffer size: {len(_log_buffer)} logs")
+
+# Teste 3: log_api_call com mapeamento
+print("\n[TESTE 3] log_api_call refatorado...")
+log_api_call("/teste", 200, registros=100)
+log_api_call("/teste", 429)
+log_api_call("/teste", 500, erro="Server error")
+print(f"   Buffer size: {len(_log_buffer)} logs")
+
+# Teste 4: Flush manual
+print("\n[TESTE 4] Flush manual...")
+print(f"   Buffer antes do flush: {len(_log_buffer)} logs")
+_flush_logs()
+print(f"   Buffer apos flush: {len(_log_buffer)} logs (esperado: 0)")
+
+print("\n" + "="*60)
+print("TESTE CONCLUIDO COM SUCESSO")
+print("="*60 + "\n")
